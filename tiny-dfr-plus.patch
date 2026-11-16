@@ -1,0 +1,519 @@
+From 7b01dfb209f2b39ac34e132f50843f0bff8381d8 Mon Sep 17 00:00:00 2001
+From: aesthytik <aesthytik@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:07:54 +0000
+Subject: [PATCH] Add Visualizer buttons and full-bar takeover for local
+ programs
+
+---
+ src/config.rs     |   2 +
+ src/main.rs       | 139 +++++++++++++++++++++++++++++++++++++++++-
+ src/takeover.rs   | 151 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/visualizer.rs |  95 +++++++++++++++++++++++++++++
+ 4 files changed, 385 insertions(+), 2 deletions(-)
+ create mode 100644 src/takeover.rs
+ create mode 100644 src/visualizer.rs
+
+diff --git a/src/config.rs b/src/config.rs
+index 063c318..2c5b98e 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -75,6 +75,7 @@ pub struct ButtonConfig {
+     pub theme: Option<String>,
+     pub time: Option<String>,
+     pub battery: Option<String>,
++    pub visualizer: Option<String>,
+     pub locale: Option<String>,
+     #[serde(deserialize_with = "array_or_single", default)]
+     pub action: Vec<Key>,
+@@ -131,6 +132,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+                     time: None,
+                     locale: None,
+                     battery: None,
++                    visualizer: None,
+                     icon_width: None,
+                     icon_height: None,
+                 },
+diff --git a/src/main.rs b/src/main.rs
+index ae3cd92..c438f12 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -46,12 +46,16 @@ mod config;
+ mod display;
+ mod fonts;
+ mod pixel_shift;
++mod takeover;
++mod visualizer;
+ 
+ use crate::config::ConfigManager;
+ use backlight::BacklightManager;
+ use config::{ButtonConfig, Config};
+ use display::DrmBackend;
+ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
++use takeover::{Frame, Takeover};
++use visualizer::AudioFeed;
+ 
+ const BUTTON_SPACING_PX: i32 = 16;
+ const BUTTON_COLOR_INACTIVE: f64 = 0.200;
+@@ -94,6 +98,7 @@ enum ButtonImage {
+     Bitmap(ImageSurface),
+     Time(Vec<ChronoItem<'static>>, Locale),
+     Battery(String, BatteryIconMode, BatteryImages),
++    Visualizer(Vec<u8>),
+     Spacer,
+ }
+ 
+@@ -268,10 +273,22 @@ impl Button {
+             } else {
+                 Button::new_text("Battery N/A".to_string(), cfg.action)
+             }
++        } else if cfg.visualizer.is_some() {
++            Button::new_visualizer(cfg.action)
+         } else {
+             Button::new_spacer()
+         }
+     }
++    fn new_visualizer(action: Vec<Key>) -> Button {
++        Button {
++            action,
++            active: false,
++            changed: false,
++            image: ButtonImage::Visualizer(Vec::new()),
++            icon_width: 0.0,
++            icon_height: 0.0,
++        }
++    }
+     fn new_spacer() -> Button {
+         Button {
+             action: vec![],
+@@ -509,6 +526,9 @@ impl Button {
+                     c.show_text(&percent_str).unwrap();
+                 }
+             }
++            ButtonImage::Visualizer(levels) => {
++                render_visualizer(c, levels, height, button_left_edge, button_width, y_shift);
++            }
+             ButtonImage::Spacer => (),
+         }
+     }
+@@ -654,7 +674,7 @@ impl FunctionLayer {
+                 );
+                 c.fill().unwrap();
+             }
+-            if !matches!(button.image, ButtonImage::Spacer) {
++            if !matches!(button.image, ButtonImage::Spacer | ButtonImage::Visualizer(_)) {
+                 button.set_background_color(&c, color);
+                 // draw box with rounded corners
+                 c.new_sub_path();
+@@ -757,6 +777,66 @@ impl FunctionLayer {
+     }
+ }
+ 
++/// Draws bars mirrored around the middle of the button, like a waveform.
++/// With no audio it draws a thin line so the slot doesn't look broken.
++fn render_visualizer(
++    c: &Context,
++    levels: &[u8],
++    height: i32,
++    left: f64,
++    width: u64,
++    y_shift: f64,
++) {
++    const BAR_GAP: f64 = 4.0;
++    const MIN_HALF: f64 = 1.5;
++    let width = width as f64;
++    let mid = y_shift + height as f64 / 2.0;
++    let max_half = height as f64 * 0.38;
++    c.set_source_rgb(0.478, 0.635, 0.969);
++    if levels.is_empty() {
++        c.rectangle(left, mid - MIN_HALF / 2.0, width, MIN_HALF);
++        c.fill().unwrap();
++        return;
++    }
++    let n = levels.len() as f64;
++    let bar_w = ((width - BAR_GAP * (n - 1.0)) / n).max(1.0);
++    for (i, &level) in levels.iter().enumerate() {
++        let half = (level as f64 / 255.0 * max_half).max(MIN_HALF);
++        let x = left + i as f64 * (bar_w + BAR_GAP);
++        c.rectangle(x.round(), (mid - half).round(), bar_w.round(), (half * 2.0).round());
++    }
++    c.fill().unwrap();
++}
++
++/// Paints a takeover frame over the whole bar, scaled up with hard pixel edges.
++///
++/// Writes straight into the (portrait) framebuffer surface: the bar's x axis
++/// runs down the surface rows and its y axis runs right to left, the same
++/// mapping the button drawing gets from its 90 degree rotation.
++fn draw_takeover(frame: &Frame, width: i32, height: i32, surface: &mut ImageSurface) {
++    let mut lut = [0u32; 256];
++    for (p, out) in lut.iter_mut().enumerate() {
++        let r = ((p >> 5) & 7) as u32 * 255 / 7;
++        let g = ((p >> 2) & 7) as u32 * 255 / 7;
++        let b = (p & 3) as u32 * 255 / 3;
++        *out = 0xff00_0000 | (r << 16) | (g << 8) | b;
++    }
++    let (w, h) = (width as usize, height as usize);
++    let stride = surface.stride() as usize;
++    let rows = surface.height() as usize;
++    let cols = (surface.width() as usize).min(h);
++    let fy_of: Vec<usize> = (0..cols).map(|sx| (h - 1 - sx) * frame.height / h).collect();
++    let mut data = surface.data().unwrap();
++    for sy in 0..w.min(rows) {
++        let fx = sy * frame.width / w;
++        let row = &mut data[sy * stride..sy * stride + cols * 4];
++        for sx in 0..cols {
++            let px = lut[frame.pixels[fy_of[sx] * frame.width + fx] as usize];
++            row[sx * 4..sx * 4 + 4].copy_from_slice(&px.to_ne_bytes());
++        }
++    }
++}
++
+ struct Interface;
+ 
+ impl LibinputInterface for Interface {
+@@ -884,6 +964,18 @@ fn real_main(drm: &mut DrmBackend) {
+     epoll
+         .add(&udev_monitor, EpollEvent::new(EpollFlags::EPOLLIN, 3))
+         .unwrap();
++    let mut audio = AudioFeed::new();
++    if let Some(fd) = audio.fd() {
++        epoll
++            .add(fd, EpollEvent::new(EpollFlags::EPOLLIN, 4))
++            .unwrap();
++    }
++    let mut takeover = Takeover::new();
++    if let Some(fd) = takeover.fd() {
++        epoll
++            .add(fd, EpollEvent::new(EpollFlags::EPOLLIN, 5))
++            .unwrap();
++    }
+     uinput.set_evbit(EventKind::Key).unwrap();
+     for k in Key::iter() {
+         uinput.set_keybit(k).unwrap();
+@@ -954,7 +1046,39 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+         }
+ 
+-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed) {
++        if audio.poll() || needs_complete_redraw {
++            for button in &mut layers[active_layer].buttons {
++                if let ButtonImage::Visualizer(levels) = &mut button.1.image {
++                    levels.clear();
++                    levels.extend_from_slice(audio.levels());
++                    button.1.changed = true;
++                }
++            }
++        }
++        if audio.is_live() {
++            next_timeout_ms = min(next_timeout_ms, visualizer::STALE_AFTER.as_millis() as i32);
++        }
++
++        let was_taken_over = takeover.active();
++        if takeover.poll() {
++            if let Some(frame) = takeover.frame() {
++                draw_takeover(frame, width as i32, height as i32, &mut surface);
++                let data = surface.data().unwrap();
++                drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
++                drm.dirty(&[ClipRect::new(0, 0, height as u16, width as u16)]).unwrap();
++            }
++            if was_taken_over && !takeover.active() {
++                needs_complete_redraw = true;
++                touches.clear();
++            }
++        }
++        if takeover.active() {
++            next_timeout_ms = min(next_timeout_ms, takeover::STALE_AFTER.as_millis() as i32);
++        }
++
++        if !takeover.active()
++            && (needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed))
++        {
+             let shift = if cfg.enable_pixel_shift {
+                 pixel_shift.get()
+             } else {
+@@ -996,6 +1120,9 @@ fn real_main(drm: &mut DrmBackend) {
+                     }
+                 }
+                 Event::Keyboard(KeyboardEvent::Key(key)) => {
++                    if takeover.active() {
++                        takeover.key(key.key(), key.key_state() == KeyState::Pressed);
++                    }
+                     if key.key() == Key::Fn as u32 {
+                         if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
+                             if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
+@@ -1017,6 +1144,14 @@ fn real_main(drm: &mut DrmBackend) {
+                     if Some(te.device()) != digitizer || backlight.current_bl() == 0 {
+                         continue;
+                     }
++                    if takeover.active() {
++                        match te {
++                            TouchEvent::Down(dn) => takeover.touch(true, dn.x_transformed(width as u32)),
++                            TouchEvent::Up(_) => takeover.touch(false, 0.0),
++                            _ => {}
++                        }
++                        continue;
++                    }
+                     match te {
+                         TouchEvent::Down(dn) => {
+                             let x = dn.x_transformed(width as u32);
+diff --git a/src/takeover.rs b/src/takeover.rs
+new file mode 100644
+index 0000000..5cdffa8
+--- /dev/null
++++ b/src/takeover.rs
+@@ -0,0 +1,151 @@
++//! Lets a local program draw on the whole Touch Bar for a while (a game, say).
++//!
++//! The program sends frames to the abstract unix datagram socket
++//! `@tiny-dfr-takeover`:
++//!
++//!   b"TDT1" | width: u16 LE | height: u16 LE | width*height bytes of RGB332
++//!
++//! While frames keep arriving the bar shows them instead of the buttons; when
++//! they stop for `STALE_AFTER` the buttons come back. The sender must have an
++//! address (an autobound abstract socket is fine) to receive input back:
++//!
++//!   b"TDE1" | kind: u8 | code: u16 LE | value: i32 LE
++//!
++//! kind 1 = key (code = evdev key code, value 1 pressed / 0 released), only for
++//! the keys in `FORWARDED_KEYS`, so no other typing is exposed; kind 2 = touch
++//! down and 3 = touch up (value = x position in pixels, 0..width).
++//!
++//! Anyone on the machine can take over the bar, which is visible to the user,
++//! and gets nothing back but those few keys while it does.
++
++use std::{
++    io::ErrorKind,
++    os::{
++        fd::{AsFd, BorrowedFd},
++        linux::net::SocketAddrExt,
++        unix::net::{SocketAddr, UnixDatagram},
++    },
++    time::{Duration, Instant},
++};
++
++pub const SOCKET_NAME: &[u8] = b"tiny-dfr-takeover";
++pub const STALE_AFTER: Duration = Duration::from_millis(500);
++const MAGIC: &[u8; 4] = b"TDT1";
++const MAX_W: usize = 2200;
++const MAX_H: usize = 64;
++const MAX_PIXELS: usize = 65536;
++/// Esc, Space, Up, Down.
++pub const FORWARDED_KEYS: [u32; 4] = [1, 57, 103, 108];
++
++pub struct Frame {
++    pub width: usize,
++    pub height: usize,
++    /// RGB332, row-major.
++    pub pixels: Vec<u8>,
++}
++
++pub struct Takeover {
++    socket: Option<UnixDatagram>,
++    frame: Option<Frame>,
++    owner: Option<SocketAddr>,
++    last_rx: Option<Instant>,
++}
++
++impl Takeover {
++    pub fn new() -> Takeover {
++        let socket = SocketAddr::from_abstract_name(SOCKET_NAME)
++            .and_then(|addr| UnixDatagram::bind_addr(&addr))
++            .and_then(|s| s.set_nonblocking(true).map(|_| s));
++        let socket = match socket {
++            Ok(s) => Some(s),
++            Err(e) => {
++                println!("Takeover socket unavailable: {e}");
++                None
++            }
++        };
++        Takeover { socket, frame: None, owner: None, last_rx: None }
++    }
++
++    pub fn fd(&self) -> Option<BorrowedFd<'_>> {
++        self.socket.as_ref().map(|s| s.as_fd())
++    }
++
++    /// Drains pending frames. Returns true when the bar has to be redrawn,
++    /// either for a new frame or because the takeover just ended.
++    pub fn poll(&mut self) -> bool {
++        let Some(socket) = &self.socket else { return false };
++        let mut buf = vec![0u8; 8 + MAX_PIXELS];
++        let mut got = false;
++        loop {
++            match socket.recv_from(&mut buf) {
++                Ok((n, addr)) => {
++                    if let Some(frame) = parse(&buf[..n]) {
++                        self.frame = Some(frame);
++                        self.owner = if addr.is_unnamed() { None } else { Some(addr) };
++                        self.last_rx = Some(Instant::now());
++                        got = true;
++                    }
++                }
++                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
++                Err(_) => break,
++            }
++        }
++        if got {
++            return true;
++        }
++        if self.frame.is_some() && self.is_stale() {
++            self.frame = None;
++            self.owner = None;
++            return true;
++        }
++        false
++    }
++
++    fn is_stale(&self) -> bool {
++        self.last_rx.map_or(true, |t| t.elapsed() > STALE_AFTER)
++    }
++
++    pub fn frame(&self) -> Option<&Frame> {
++        self.frame.as_ref()
++    }
++
++    pub fn active(&self) -> bool {
++        self.frame.is_some()
++    }
++
++    fn send(&self, kind: u8, code: u16, value: i32) {
++        let (Some(socket), Some(owner)) = (&self.socket, &self.owner) else { return };
++        let mut msg = Vec::with_capacity(11);
++        msg.extend_from_slice(b"TDE1");
++        msg.push(kind);
++        msg.extend_from_slice(&code.to_le_bytes());
++        msg.extend_from_slice(&value.to_le_bytes());
++        let _ = socket.send_to_addr(&msg, owner);
++    }
++
++    pub fn key(&self, code: u32, pressed: bool) {
++        if FORWARDED_KEYS.contains(&code) {
++            self.send(1, code as u16, pressed as i32);
++        }
++    }
++
++    pub fn touch(&self, down: bool, x: f64) {
++        self.send(if down { 2 } else { 3 }, 0, x as i32);
++    }
++}
++
++fn parse(msg: &[u8]) -> Option<Frame> {
++    if msg.len() < 8 || &msg[..4] != MAGIC {
++        return None;
++    }
++    let width = u16::from_le_bytes([msg[4], msg[5]]) as usize;
++    let height = u16::from_le_bytes([msg[6], msg[7]]) as usize;
++    if width == 0 || height == 0 || width > MAX_W || height > MAX_H || width * height > MAX_PIXELS {
++        return None;
++    }
++    let pixels = &msg[8..];
++    if pixels.len() != width * height {
++        return None;
++    }
++    Some(Frame { width, height, pixels: pixels.to_vec() })
++}
+diff --git a/src/visualizer.rs b/src/visualizer.rs
+new file mode 100644
+index 0000000..f0e0988
+--- /dev/null
++++ b/src/visualizer.rs
+@@ -0,0 +1,95 @@
++//! Receives audio levels for `Visualizer` buttons.
++//!
++//! Any local process can send bar heights as a datagram to the abstract unix
++//! socket `@tiny-dfr-visualizer`: one byte per bar, 0 (silent) to 255 (loud),
++//! at most `MAX_BARS` bars. Abstract sockets need no filesystem access, so this
++//! works after tiny-dfr drops privileges and inside its systemd sandbox. The
++//! data only changes what is drawn, so accepting it from any sender is harmless.
++
++use std::{
++    io::ErrorKind,
++    os::{
++        fd::{AsFd, BorrowedFd},
++        linux::net::SocketAddrExt,
++        unix::net::{SocketAddr, UnixDatagram},
++    },
++    time::{Duration, Instant},
++};
++
++pub const SOCKET_NAME: &[u8] = b"tiny-dfr-visualizer";
++pub const MAX_BARS: usize = 256;
++/// After this long without data the bars fall back to silence.
++pub const STALE_AFTER: Duration = Duration::from_millis(500);
++
++pub struct AudioFeed {
++    socket: Option<UnixDatagram>,
++    levels: Vec<u8>,
++    last_rx: Option<Instant>,
++}
++
++impl AudioFeed {
++    pub fn new() -> AudioFeed {
++        let socket = SocketAddr::from_abstract_name(SOCKET_NAME)
++            .and_then(|addr| UnixDatagram::bind_addr(&addr))
++            .and_then(|s| s.set_nonblocking(true).map(|_| s));
++        let socket = match socket {
++            Ok(s) => Some(s),
++            Err(e) => {
++                println!("Visualizer socket unavailable, waveform disabled: {e}");
++                None
++            }
++        };
++        AudioFeed {
++            socket,
++            levels: Vec::new(),
++            last_rx: None,
++        }
++    }
++
++    pub fn fd(&self) -> Option<BorrowedFd<'_>> {
++        self.socket.as_ref().map(|s| s.as_fd())
++    }
++
++    /// Drains pending datagrams. Returns true when the levels to draw changed.
++    pub fn poll(&mut self) -> bool {
++        let Some(socket) = &self.socket else {
++            return false;
++        };
++        let mut buf = [0u8; MAX_BARS];
++        let mut latest: Option<Vec<u8>> = None;
++        loop {
++            match socket.recv(&mut buf) {
++                Ok(n) if n > 0 => latest = Some(buf[..n].to_vec()),
++                Ok(_) => {}
++                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
++                Err(_) => break,
++            }
++        }
++        if let Some(levels) = latest {
++            self.last_rx = Some(Instant::now());
++            if levels != self.levels {
++                self.levels = levels;
++                return true;
++            }
++            return false;
++        }
++        if self.is_stale() && self.levels.iter().any(|&l| l > 0) {
++            self.levels.iter_mut().for_each(|l| *l = 0);
++            return true;
++        }
++        false
++    }
++
++    fn is_stale(&self) -> bool {
++        self.last_rx.map_or(true, |t| t.elapsed() > STALE_AFTER)
++    }
++
++    /// True while audio is arriving, so the main loop wakes up to notice when it stops.
++    pub fn is_live(&self) -> bool {
++        !self.is_stale() && self.levels.iter().any(|&l| l > 0)
++    }
++
++    pub fn levels(&self) -> &[u8] {
++        &self.levels
++    }
++}
+-- 
+2.56.0
+

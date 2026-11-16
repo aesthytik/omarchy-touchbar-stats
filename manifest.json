@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.aesthytik.touchbar-stats",
+  "name": "Touch Bar Stats",
+  "version": "0.1.0",
+  "author": "aesthytik",
+  "license": "MIT",
+  "description": "AI usage limits (Claude, Codex and more) and live CPU, RAM, temperature, battery and network stats across the MacBook Touch Bar.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
