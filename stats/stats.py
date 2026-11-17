@@ -17,7 +17,8 @@ import time
 import cairo
 
 W, H = 1085, 30              # logical pixels; tiny-dfr scales them 2x to 2170x60
-TAKEOVER = b"\0tiny-dfr-takeover"
+# Lives in root-owned /run/tiny-dfr, so only the daemon can own this name.
+TAKEOVER = "/run/tiny-dfr/takeover.sock"
 SEND_EVERY = 0.2             # tiny-dfr drops a takeover after 0.5 s without frames
 SAMPLE_EVERY = 1.0
 USAGE_DIR = os.path.expanduser("~/.local/state/omarchy/agents/usage")
@@ -390,15 +391,16 @@ def main():
                 last_refresh = now
         try:
             sock.sendto(header + frame, TAKEOVER)
-        except (ConnectionRefusedError, FileNotFoundError, BlockingIOError):
+        except (ConnectionRefusedError, FileNotFoundError, PermissionError, BlockingIOError):
             pass
         r, _, _ = select.select([sock], [], [], SEND_EVERY)
         if r:
             try:
-                msg = sock.recv(64)
+                msg, sender = sock.recvfrom(64)
             except BlockingIOError:
                 continue
-            if len(msg) == 11 and msg[:4] == b"TDE1" and msg[4] == 2:
+            # Only the daemon can send from its socket path; ignore anyone else.
+            if sender == TAKEOVER and len(msg) == 11 and msg[:4] == b"TDE1" and msg[4] == 2:
                 return                  # a tap on the bar closes the stats
 
 

@@ -1,4 +1,6 @@
-# tiny-dfr-plus: tiny-dfr with Visualizer buttons and full-bar takeover.
+# tiny-dfr-plus: tiny-dfr with Visualizer buttons, full-bar takeover and a
+# full-colour backdrop, served on sockets in /run/tiny-dfr to the user at the
+# screen only.
 # Shared by the aesthytik Touch Bar plugins; keep this file and
 # tiny-dfr-plus.patch identical across them. Sourced, not executed.
 #
@@ -17,12 +19,15 @@ plus_build() {
   if [[ -x $src/target/release/tiny-dfr && "$(cat "$PLUS_CACHE/built" 2>/dev/null)" == "$stamp" ]]; then
     echo "$src/target/release/tiny-dfr"; return
   fi
+  # Build only the exact upstream commit the patch was written against.
+  [[ $PLUS_COMMIT =~ ^[0-9a-f]{40}$ ]] || { echo "tiny-dfr-plus: PLUS_COMMIT must be a full commit SHA" >&2; return 1; }
   if [[ ! -d $src/.git ]]; then
-    mkdir -p "$PLUS_CACHE"
-    git clone --quiet "$PLUS_REPO" "$src"
+    mkdir -p "$src"
+    git -C "$src" init --quiet
   fi
-  git -C "$src" fetch --quiet origin "$PLUS_COMMIT" 2>/dev/null || true
-  git -C "$src" checkout --quiet --force "$PLUS_COMMIT"
+  git -C "$src" fetch --quiet --depth 1 "$PLUS_REPO" "$PLUS_COMMIT"
+  git -C "$src" checkout --quiet --force --detach "$PLUS_COMMIT"
+  [[ "$(git -C "$src" rev-parse HEAD)" == "$PLUS_COMMIT" ]] || { echo "tiny-dfr-plus: checkout is not $PLUS_COMMIT" >&2; return 1; }
   git -C "$src" clean --quiet -fdx -e target
   git -C "$src" apply "$patch"
   cargo build --quiet --release --locked --manifest-path "$src/Cargo.toml" >&2

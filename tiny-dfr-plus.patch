@@ -1,23 +1,301 @@
-From 7b01dfb209f2b39ac34e132f50843f0bff8381d8 Mon Sep 17 00:00:00 2001
-From: aesthytik <aesthytik@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 13:07:54 +0000
-Subject: [PATCH] Add Visualizer buttons and full-bar takeover for local
- programs
-
----
- src/config.rs     |   2 +
- src/main.rs       | 139 +++++++++++++++++++++++++++++++++++++++++-
- src/takeover.rs   | 151 ++++++++++++++++++++++++++++++++++++++++++++++
- src/visualizer.rs |  95 +++++++++++++++++++++++++++++
- 4 files changed, 385 insertions(+), 2 deletions(-)
- create mode 100644 src/takeover.rs
- create mode 100644 src/visualizer.rs
-
+diff --git a/src/backdrop.rs b/src/backdrop.rs
+new file mode 100644
+index 0000000..2c38a82
+--- /dev/null
++++ b/src/backdrop.rs
+@@ -0,0 +1,271 @@
++//! Lets a local program paint a live, full colour background behind the
++//! buttons. The buttons keep working and are drawn over it as glass.
++//!
++//! The program sends frames, split into row bands that fit in a datagram, to
++//! the unix datagram socket `/run/tiny-dfr/backdrop.sock`:
++//!
++//!   b"TDB1" | width u16 | height u16 | y0 u16 | rows u16 | rows*width*4 bytes
++//!
++//! all little endian. Magic b"TDS1" instead sends a solo frame: the bar shows
++//! only the picture, with no buttons, and touches go only to the sender
++//! (holding fn brings the buttons back while it is held). Pixels are 0x00RRGGBB u32s, row-major in bar
++//! coordinates (x along the bar, y down). A frame is shown when its last band
++//! (y0 + rows == height) arrives. When frames stop for `STALE_AFTER` the
++//! normal black background comes back.
++//!
++//! The sender gets events back at its (autobound) address:
++//!
++//!   b"TDE1" | kind u8 | code u16 LE | value i32 LE
++//!
++//! kind 2/3/4 = touch down/up/motion (code = slot, value = x in pixels);
++//! kind 5 = backlight (value = brightness, 0 means the bar is off);
++//! kind 6 = a key was pressed (value = x in pixels of the key's column,
++//! rounded to a whole key width, never which key). Kind 6 is only sent when
++//! `KeyPulses = true` in the config.
++//!
++//! Only the user at the screen (or root) is listened to and answered; frames
++//! from anyone else are dropped (see `peer.rs`).
++
++use crate::peer::{self, Peer, Recv};
++use std::{
++    os::{
++        fd::{AsFd, BorrowedFd},
++        unix::net::UnixDatagram,
++    },
++    time::{Duration, Instant},
++};
++
++pub const SOCKET_NAME: &str = "backdrop.sock";
++pub const STALE_AFTER: Duration = Duration::from_millis(1000);
++const MAGIC: &[u8; 4] = b"TDB1";
++const MAGIC_SOLO: &[u8; 4] = b"TDS1";
++const MAX_W: usize = 2200;
++const MAX_H: usize = 64;
++const MAX_MSG: usize = 12 + MAX_W * MAX_H * 4;
++
++pub struct Backdrop {
++    socket: Option<UnixDatagram>,
++    width: usize,
++    height: usize,
++    /// 0x00RRGGBB, row-major, bar coordinates.
++    pixels: Vec<u32>,
++    owner: Option<Peer>,
++    last_rx: Option<Instant>,
++    shown: bool,
++    solo: bool,
++    buf: Vec<u8>,
++    last_bl: Option<u32>,
++}
++
++impl Backdrop {
++    pub fn new() -> Backdrop {
++        let socket = peer::bind(SOCKET_NAME);
++        let socket = match socket {
++            Ok(s) => Some(s),
++            Err(e) => {
++                println!("Backdrop socket unavailable: {e}");
++                None
++            }
++        };
++        Backdrop {
++            socket,
++            width: 0,
++            height: 0,
++            pixels: Vec::new(),
++            owner: None,
++            last_rx: None,
++            shown: false,
++            solo: false,
++            buf: vec![0u8; MAX_MSG],
++            last_bl: None,
++        }
++    }
++
++    pub fn fd(&self) -> Option<BorrowedFd<'_>> {
++        self.socket.as_ref().map(|s| s.as_fd())
++    }
++
++    /// Drains pending bands. Returns true when the bar has to be redrawn:
++    /// a frame completed, or the backdrop just went away.
++    pub fn poll(&mut self) -> bool {
++        let Some(socket) = &self.socket else { return false };
++        let mut complete = false;
++        loop {
++            match peer::recv(socket, &mut self.buf) {
++                Ok(Recv::Ok(n, from)) => {
++                    let msg = &self.buf[..n];
++                    if msg.len() < 12 || (&msg[..4] != MAGIC && &msg[..4] != MAGIC_SOLO) {
++                        continue;
++                    }
++                    let rd = |i: usize| u16::from_le_bytes([msg[i], msg[i + 1]]) as usize;
++                    let (w, h, y0, rows) = (rd(4), rd(6), rd(8), rd(10));
++                    if w == 0 || h == 0 || w > MAX_W || h > MAX_H || y0 + rows > h {
++                        continue;
++                    }
++                    if msg.len() != 12 + rows * w * 4 {
++                        continue;
++                    }
++                    if w != self.width || h != self.height {
++                        self.width = w;
++                        self.height = h;
++                        self.pixels = vec![0; w * h];
++                    }
++                    let dst = &mut self.pixels[y0 * w..(y0 + rows) * w];
++                    for (d, s) in dst.iter_mut().zip(msg[12..].chunks_exact(4)) {
++                        *d = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
++                    }
++                    self.solo = &msg[..4] == MAGIC_SOLO;
++                    self.owner = Some(from);
++                    self.last_rx = Some(Instant::now());
++                    if y0 + rows == h {
++                        complete = true;
++                    }
++                }
++                Ok(Recv::Ignored) => {}
++                Ok(Recv::WouldBlock) | Err(_) => break,
++            }
++        }
++        if complete {
++            self.shown = true;
++            return true;
++        }
++        if self.shown && self.last_rx.map_or(true, |t| t.elapsed() > STALE_AFTER) {
++            self.shown = false;
++            self.owner = None;
++            self.last_bl = None;
++            return true;
++        }
++        false
++    }
++
++    pub fn active(&self) -> bool {
++        self.shown
++    }
++
++    pub fn solo(&self) -> bool {
++        self.shown && self.solo
++    }
++
++    fn send(&self, kind: u8, code: u16, value: i32) {
++        let (Some(socket), Some(owner)) = (&self.socket, &self.owner) else { return };
++        let mut msg = Vec::with_capacity(11);
++        msg.extend_from_slice(b"TDE1");
++        msg.push(kind);
++        msg.extend_from_slice(&code.to_le_bytes());
++        msg.extend_from_slice(&value.to_le_bytes());
++        owner.send(socket, &msg);
++    }
++
++    pub fn touch(&self, kind: u8, slot: u32, x: f64) {
++        self.send(kind, slot as u16, x as i32);
++    }
++
++    pub fn backlight(&mut self, value: u32) {
++        if self.shown && self.last_bl != Some(value) {
++            self.last_bl = Some(value);
++            self.send(5, 0, value as i32);
++        }
++    }
++
++    /// A key went down: tell the backdrop roughly where, as a column only.
++    pub fn key_pulse(&self, code: u32, bar_width: u32) {
++        if let Some(frac) = key_column(code) {
++            const COLS: f64 = 14.5;
++            let col = (frac * COLS).floor() + 0.5;
++            self.send(6, 0, (col / COLS * bar_width as f64) as i32);
++        }
++    }
++
++    /// Composites the backdrop with the button layer (premultiplied ARGB in
++    /// the portrait framebuffer layout) into `out`, also portrait.
++    pub fn compose(&self, overlay: Option<&[u8]>, out: &mut [u8], stride: usize, rows: usize, cols: usize) {
++        let (w, h) = (self.width, self.height);
++        if w == 0 {
++            return;
++        }
++        for sy in 0..rows {
++            let bx = sy * w / rows;
++            let d_row = &mut out[sy * stride..sy * stride + cols * 4];
++            for sx in 0..cols {
++                let by = (cols - 1 - sx) * h / cols;
++                let bg = self.pixels[by * w + bx];
++                let o = match overlay {
++                    Some(ov) => {
++                        let i = sy * stride + sx * 4;
++                        u32::from_ne_bytes([ov[i], ov[i + 1], ov[i + 2], ov[i + 3]])
++                    }
++                    None => 0,
++                };
++                let a = o >> 24;
++                let px = if a == 0 {
++                    bg
++                } else if a == 255 {
++                    o
++                } else {
++                    let inv = 255 - a;
++                    let ch = |s: u32| {
++                        let fg = (o >> s) & 0xff;
++                        let b = (bg >> s) & 0xff;
++                        (fg + (b * inv + 127) / 255).min(255) << s
++                    };
++                    ch(16) | ch(8) | ch(0)
++                };
++                d_row[sx * 4..sx * 4 + 4].copy_from_slice(&(0xff00_0000 | px).to_ne_bytes());
++            }
++        }
++    }
++}
++
++/// Where a key sits across a MacBook (ANSI) keyboard, 0..1 from the left.
++fn key_column(code: u32) -> Option<f64> {
++    // (first code, keys..., widths) per row, as (code, centre in key units).
++    const ROW_W: f64 = 14.5;
++    let row = |codes: &[u32], lead: f64, code: u32| -> Option<f64> {
++        codes.iter().position(|&c| c == code).map(|i| (lead + i as f64 + 0.5) / ROW_W)
++    };
++    // Number row: ` 1..0 - = then backspace (1.5).
++    if code == 14 {
++        return Some((13.0 + 0.75) / ROW_W);
++    }
++    if let Some(x) = row(&[41, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], 0.0, code) {
++        return Some(x);
++    }
++    if code == 15 {
++        return Some(0.75 / ROW_W);
++    }
++    if let Some(x) = row(&[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 43], 1.5, code) {
++        return Some(x);
++    }
++    if code == 58 {
++        return Some(0.875 / ROW_W);
++    }
++    if code == 28 {
++        return Some((ROW_W - 0.875) / ROW_W);
++    }
++    if let Some(x) = row(&[30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40], 1.75, code) {
++        return Some(x);
++    }
++    if code == 42 {
++        return Some(1.125 / ROW_W);
++    }
++    if code == 54 {
++        return Some((ROW_W - 1.125) / ROW_W);
++    }
++    if let Some(x) = row(&[44, 45, 46, 47, 48, 49, 50, 51, 52, 53], 2.25, code) {
++        return Some(x);
++    }
++    let bottom = match code {
++        464 => 0.5,  // fn
++        29 => 1.5,   // ctrl
++        56 => 2.5,   // alt
++        125 => 3.6,  // super
++        57 => 7.0,   // space
++        126 => 10.4, // right super
++        100 => 11.5, // right alt
++        105 => 12.5, // left
++        103 | 108 => 13.5,
++        106 => 14.5 - 0.5,
++        _ => return None,
++    };
++    Some(bottom / ROW_W)
++}
 diff --git a/src/config.rs b/src/config.rs
-index 063c318..2c5b98e 100644
+index 063c318..716aab2 100644
 --- a/src/config.rs
 +++ b/src/config.rs
-@@ -75,6 +75,7 @@ pub struct ButtonConfig {
+@@ -23,6 +23,7 @@ pub struct Config {
+     pub adaptive_brightness: bool,
+     pub active_brightness: u32,
+     pub double_press_switch_layers: u32,
++    pub key_pulses: bool,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -35,6 +36,7 @@ struct ConfigProxy {
+     adaptive_brightness: Option<bool>,
+     active_brightness: Option<u32>,
+     double_press_switch_layers: Option<u32>,
++    key_pulses: Option<bool>,
+     primary_layer_keys: Option<Vec<ButtonConfig>>,
+     media_layer_keys: Option<Vec<ButtonConfig>>,
+ }
+@@ -75,6 +77,7 @@ pub struct ButtonConfig {
      pub theme: Option<String>,
      pub time: Option<String>,
      pub battery: Option<String>,
@@ -25,7 +303,15 @@ index 063c318..2c5b98e 100644
      pub locale: Option<String>,
      #[serde(deserialize_with = "array_or_single", default)]
      pub action: Vec<Key>,
-@@ -131,6 +132,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+@@ -115,6 +118,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
+         base.active_brightness = user.active_brightness.or(base.active_brightness);
+         base.double_press_switch_layers = user.double_press_switch_layers.or(base.double_press_switch_layers);
++        base.key_pulses = user.key_pulses.or(base.key_pulses);
+     };
+     let mut media_layer_keys = base.media_layer_keys.unwrap();
+     let mut primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -131,6 +135,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
                      time: None,
                      locale: None,
                      battery: None,
@@ -33,18 +319,34 @@ index 063c318..2c5b98e 100644
                      icon_width: None,
                      icon_height: None,
                  },
+@@ -151,6 +156,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+         font_face: load_font(&base.font_template.unwrap()),
+         active_brightness: base.active_brightness.unwrap(),
+         double_press_switch_layers: base.double_press_switch_layers.unwrap(),
++        key_pulses: base.key_pulses.unwrap_or(false),
+     };
+     (cfg, layers)
+ }
 diff --git a/src/main.rs b/src/main.rs
-index ae3cd92..c438f12 100644
+index ae3cd92..63eeaef 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -46,12 +46,16 @@ mod config;
+@@ -41,17 +41,24 @@ use std::{
+ };
+ use udev::MonitorBuilder;
+ 
++mod backdrop;
+ mod backlight;
+ mod config;
  mod display;
  mod fonts;
++mod peer;
  mod pixel_shift;
 +mod takeover;
 +mod visualizer;
  
  use crate::config::ConfigManager;
++use backdrop::Backdrop;
  use backlight::BacklightManager;
  use config::{ButtonConfig, Config};
  use display::DrmBackend;
@@ -54,7 +356,7 @@ index ae3cd92..c438f12 100644
  
  const BUTTON_SPACING_PX: i32 = 16;
  const BUTTON_COLOR_INACTIVE: f64 = 0.200;
-@@ -94,6 +98,7 @@ enum ButtonImage {
+@@ -94,6 +101,7 @@ enum ButtonImage {
      Bitmap(ImageSurface),
      Time(Vec<ChronoItem<'static>>, Locale),
      Battery(String, BatteryIconMode, BatteryImages),
@@ -62,7 +364,7 @@ index ae3cd92..c438f12 100644
      Spacer,
  }
  
-@@ -268,10 +273,22 @@ impl Button {
+@@ -268,10 +276,22 @@ impl Button {
              } else {
                  Button::new_text("Battery N/A".to_string(), cfg.action)
              }
@@ -85,7 +387,7 @@ index ae3cd92..c438f12 100644
      fn new_spacer() -> Button {
          Button {
              action: vec![],
-@@ -509,6 +526,9 @@ impl Button {
+@@ -509,6 +529,9 @@ impl Button {
                      c.show_text(&percent_str).unwrap();
                  }
              }
@@ -95,16 +397,82 @@ index ae3cd92..c438f12 100644
              ButtonImage::Spacer => (),
          }
      }
-@@ -654,7 +674,7 @@ impl FunctionLayer {
+@@ -523,16 +546,16 @@ impl Button {
+             toggle_keys(uinput, &self.action, active as i32);
+         }
+     }
+-    fn set_background_color(&self, c: &Context, color: f64) {
++    fn set_background_color(&self, c: &Context, color: f64, alpha: f64) {
+         if let ButtonImage::Battery(battery, _, _) = &self.image {
+             let (_, state) = get_battery_state(battery);
+             match state {
+-                BatteryState::NotCharging => c.set_source_rgb(color, color, color),
+-                BatteryState::Charging => c.set_source_rgb(0.0, color, 0.0),
+-                BatteryState::Low => c.set_source_rgb(color, 0.0, 0.0),
++                BatteryState::NotCharging => c.set_source_rgba(color, color, color, alpha),
++                BatteryState::Charging => c.set_source_rgba(0.0, color, 0.0, alpha),
++                BatteryState::Low => c.set_source_rgba(color, 0.0, 0.0, alpha),
+             }
+         } else {
+-            c.set_source_rgb(color, color, color);
++            c.set_source_rgba(color, color, color, alpha);
+         }
+     }
+ }
+@@ -585,6 +608,7 @@ impl FunctionLayer {
+         surface: &Surface,
+         pixel_shift: (f64, f64),
+         complete_redraw: bool,
++        glass: bool,
+     ) -> Vec<ClipRect> {
+         let c = Context::new(surface).unwrap();
+         let mut modified_regions = if complete_redraw {
+@@ -609,8 +633,12 @@ impl FunctionLayer {
+         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
+ 
+         if complete_redraw {
++            if glass {
++                c.set_operator(cairo::Operator::Clear);
++            }
+             c.set_source_rgb(0.0, 0.0, 0.0);
+             c.paint().unwrap();
++            c.set_operator(cairo::Operator::Over);
+         }
+         c.set_font_face(&config.font_face);
+         c.set_font_size(32.0);
+@@ -644,7 +672,16 @@ impl FunctionLayer {
+             } else {
+                 0.0
+             };
++            // Over a backdrop, buttons are tinted glass so it glows through.
++            let alpha = match (glass, button.active) {
++                (false, _) => 1.0,
++                (true, false) => 0.5,
++                (true, true) => 0.85,
++            };
+             if !complete_redraw {
++                if glass {
++                    c.set_operator(cairo::Operator::Clear);
++                }
+                 c.set_source_rgb(0.0, 0.0, 0.0);
+                 c.rectangle(
+                     left_edge,
+@@ -653,9 +690,12 @@ impl FunctionLayer {
+                     top - bot + radius * 2.0,
                  );
                  c.fill().unwrap();
++                c.set_operator(cairo::Operator::Over);
              }
 -            if !matches!(button.image, ButtonImage::Spacer) {
-+            if !matches!(button.image, ButtonImage::Spacer | ButtonImage::Visualizer(_)) {
-                 button.set_background_color(&c, color);
+-                button.set_background_color(&c, color);
++            if !matches!(button.image, ButtonImage::Spacer | ButtonImage::Visualizer(_))
++                && (!glass || color > 0.0)
++            {
++                button.set_background_color(&c, color, alpha);
                  // draw box with rounded corners
                  c.new_sub_path();
-@@ -757,6 +777,66 @@ impl FunctionLayer {
+                 let left = left_edge + radius;
+@@ -757,6 +797,66 @@ impl FunctionLayer {
      }
  }
  
@@ -171,26 +539,52 @@ index ae3cd92..c438f12 100644
  struct Interface;
  
  impl LibinputInterface for Interface {
-@@ -884,6 +964,18 @@ fn real_main(drm: &mut DrmBackend) {
+@@ -847,6 +947,12 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut pixel_shift = PixelShiftManager::new();
+     let mut last = Instant::now();
+ 
++    // The local-program sockets live in root-owned /run/tiny-dfr, so make
++    // them while still root.
++    let mut audio = AudioFeed::new();
++    let mut takeover = Takeover::new();
++    let mut backdrop = Backdrop::new();
++
+     // drop privileges to input and video group
+     let groups = ["input", "video"];
+ 
+@@ -884,6 +990,23 @@ fn real_main(drm: &mut DrmBackend) {
      epoll
          .add(&udev_monitor, EpollEvent::new(EpollFlags::EPOLLIN, 3))
          .unwrap();
-+    let mut audio = AudioFeed::new();
 +    if let Some(fd) = audio.fd() {
 +        epoll
 +            .add(fd, EpollEvent::new(EpollFlags::EPOLLIN, 4))
 +            .unwrap();
 +    }
-+    let mut takeover = Takeover::new();
 +    if let Some(fd) = takeover.fd() {
 +        epoll
 +            .add(fd, EpollEvent::new(EpollFlags::EPOLLIN, 5))
 +            .unwrap();
 +    }
++    if let Some(fd) = backdrop.fd() {
++        epoll
++            .add(fd, EpollEvent::new(EpollFlags::EPOLLIN, 6))
++            .unwrap();
++    }
++    let mut overlay =
++        ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
      uinput.set_evbit(EventKind::Key).unwrap();
      for k in Key::iter() {
          uinput.set_keybit(k).unwrap();
-@@ -954,7 +1046,39 @@ fn real_main(drm: &mut DrmBackend) {
+@@ -908,6 +1031,7 @@ fn real_main(drm: &mut DrmBackend) {
+     uinput.dev_create().unwrap();
+ 
+     let mut digitizer: Option<InputDevice> = None;
++    let mut fn_held = false;
+     let mut touches = HashMap::<u32, (usize, usize)>::new();
+     let mut last_redraw_ts = if layers[active_layer].faster_refresh {
+         Local::now().second()
+@@ -954,7 +1078,82 @@ fn real_main(drm: &mut DrmBackend) {
              }
          }
  
@@ -225,23 +619,87 @@ index ae3cd92..c438f12 100644
 +            next_timeout_ms = min(next_timeout_ms, takeover::STALE_AFTER.as_millis() as i32);
 +        }
 +
-+        if !takeover.active()
-+            && (needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed))
-+        {
++        let had_backdrop = backdrop.active();
++        let backdrop_frame = backdrop.poll();
++        if had_backdrop != backdrop.active() {
++            needs_complete_redraw = true;
++        }
++        if backdrop.active() {
++            next_timeout_ms = min(next_timeout_ms, backdrop::STALE_AFTER.as_millis() as i32);
++            backdrop.backlight(backlight.current_bl());
++        }
++        let buttons_dirty =
++            needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed);
++
++        if !takeover.active() && backdrop.active() {
++            if buttons_dirty {
++                let shift = if cfg.enable_pixel_shift {
++                    pixel_shift.get()
++                } else {
++                    (0.0, 0.0)
++                };
++                layers[active_layer].draw(
++                    &cfg,
++                    width as i32,
++                    height as i32,
++                    &overlay,
++                    shift,
++                    needs_complete_redraw,
++                    true,
++                );
++                needs_complete_redraw = false;
++            }
++            if (buttons_dirty || backdrop_frame) && backlight.current_bl() > 0 {
++                overlay.flush();
++                let stride = surface.stride() as usize;
++                let rows = (surface.height() as usize).min(width as usize);
++                let cols = (surface.width() as usize).min(height as usize);
++                {
++                    let over = overlay.data().unwrap();
++                    let mut out = surface.data().unwrap();
++                    let buttons = !backdrop.solo() || fn_held;
++                    backdrop.compose(buttons.then_some(&over[..]), &mut out, stride, rows, cols);
++                }
++                let data = surface.data().unwrap();
++                drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
++                drm.dirty(&[ClipRect::new(0, 0, height as u16, width as u16)]).unwrap();
++            }
++        } else if !takeover.active() && buttons_dirty {
              let shift = if cfg.enable_pixel_shift {
                  pixel_shift.get()
              } else {
-@@ -996,6 +1120,9 @@ fn real_main(drm: &mut DrmBackend) {
+@@ -967,6 +1166,7 @@ fn real_main(drm: &mut DrmBackend) {
+                 &surface,
+                 shift,
+                 needs_complete_redraw,
++                false,
+             );
+             let data = surface.data().unwrap();
+             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
+@@ -996,7 +1196,22 @@ fn real_main(drm: &mut DrmBackend) {
                      }
                  }
                  Event::Keyboard(KeyboardEvent::Key(key)) => {
++                    if backdrop.active()
++                        && cfg.key_pulses
++                        && !takeover.active()
++                        && key.key_state() == KeyState::Pressed
++                    {
++                        backdrop.key_pulse(key.key(), width as u32);
++                    }
 +                    if takeover.active() {
 +                        takeover.key(key.key(), key.key_state() == KeyState::Pressed);
 +                    }
                      if key.key() == Key::Fn as u32 {
++                        let held = key.key_state() == KeyState::Pressed;
++                        if held != fn_held {
++                            fn_held = held;
++                            needs_complete_redraw = true;
++                        }
                          if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
                              if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
-@@ -1017,6 +1144,14 @@ fn real_main(drm: &mut DrmBackend) {
+                                 layers.swap(0, 1);
+@@ -1017,6 +1232,29 @@ fn real_main(drm: &mut DrmBackend) {
                      if Some(te.device()) != digitizer || backlight.current_bl() == 0 {
                          continue;
                      }
@@ -253,19 +711,187 @@ index ae3cd92..c438f12 100644
 +                        }
 +                        continue;
 +                    }
++                    if backdrop.active() {
++                        match &te {
++                            TouchEvent::Down(dn) => {
++                                backdrop.touch(2, dn.seat_slot(), dn.x_transformed(width as u32))
++                            }
++                            TouchEvent::Motion(mt) => {
++                                backdrop.touch(4, mt.seat_slot(), mt.x_transformed(width as u32))
++                            }
++                            TouchEvent::Up(up) => backdrop.touch(3, up.seat_slot(), 0.0),
++                            _ => {}
++                        }
++                        if backdrop.solo() && !fn_held {
++                            continue;
++                        }
++                    }
                      match te {
                          TouchEvent::Down(dn) => {
                              let x = dn.x_transformed(width as u32);
+diff --git a/src/peer.rs b/src/peer.rs
+new file mode 100644
+index 0000000..d11f54a
+--- /dev/null
++++ b/src/peer.rs
+@@ -0,0 +1,147 @@
++//! Sockets that local programs talk to, with every sender checked.
++//!
++//! The sockets are files in `/run/tiny-dfr` (systemd's RuntimeDirectory, owned
++//! by root), created before tiny-dfr drops privileges, so no other account can
++//! claim their names first. Each one has SO_PASSCRED set, so the kernel
++//! attaches the sender's real uid to every datagram; only the user at the
++//! screen (logind's active user on seat0) or root is listened to, and only
++//! they are sent anything back.
++
++use std::{
++    fs, io, mem,
++    os::{
++        fd::AsRawFd,
++        unix::{fs::PermissionsExt, net::UnixDatagram},
++    },
++    path::Path,
++    sync::Mutex,
++    time::{Duration, Instant},
++};
++
++pub const DIR: &str = "/run/tiny-dfr";
++
++/// Binds `/run/tiny-dfr/<name>`, writable by everyone so any program can
++/// send; whether it is listened to is decided per datagram by `allowed`.
++pub fn bind(name: &str) -> io::Result<UnixDatagram> {
++    let _ = fs::create_dir_all(DIR);
++    let path = Path::new(DIR).join(name);
++    let _ = fs::remove_file(&path);
++    let socket = UnixDatagram::bind(&path)?;
++    fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
++    let one: libc::c_int = 1;
++    // SAFETY: plain setsockopt on a socket we own, with a correctly sized int.
++    let r = unsafe {
++        libc::setsockopt(
++            socket.as_raw_fd(),
++            libc::SOL_SOCKET,
++            libc::SO_PASSCRED,
++            &one as *const libc::c_int as *const libc::c_void,
++            mem::size_of::<libc::c_int>() as libc::socklen_t,
++        )
++    };
++    if r != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    socket.set_nonblocking(true)?;
++    Ok(socket)
++}
++
++/// Who sent a datagram, and where to answer.
++#[derive(Clone, Copy)]
++pub struct Peer {
++    addr: libc::sockaddr_un,
++    len: libc::socklen_t,
++    pub uid: u32,
++}
++
++impl Peer {
++    /// Unbound senders can't be answered.
++    pub fn has_address(&self) -> bool {
++        self.len as usize > mem::size_of::<libc::sa_family_t>()
++    }
++
++    pub fn send(&self, socket: &UnixDatagram, msg: &[u8]) {
++        if !self.has_address() || !allowed(self.uid) {
++            return;
++        }
++        // SAFETY: addr/len came from recvmsg for this socket family.
++        unsafe {
++            libc::sendto(
++                socket.as_raw_fd(),
++                msg.as_ptr() as *const libc::c_void,
++                msg.len(),
++                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
++                &self.addr as *const libc::sockaddr_un as *const libc::sockaddr,
++                self.len,
++            );
++        }
++    }
++}
++
++pub enum Recv {
++    /// A datagram from someone allowed to drive the bar: its length.
++    Ok(usize, Peer),
++    /// Something arrived but is ignored (wrong user, truncated).
++    Ignored,
++    WouldBlock,
++}
++
++/// Receives one datagram and checks its sender.
++pub fn recv(socket: &UnixDatagram, buf: &mut [u8]) -> io::Result<Recv> {
++    // SAFETY: zeroed POD structs, filled in by recvmsg; the control buffer is
++    // u64-aligned and large enough for one SCM_CREDENTIALS message.
++    unsafe {
++        let mut addr: libc::sockaddr_un = mem::zeroed();
++        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
++        let mut control = [0u64; 8];
++        let mut msg: libc::msghdr = mem::zeroed();
++        msg.msg_name = &mut addr as *mut libc::sockaddr_un as *mut libc::c_void;
++        msg.msg_namelen = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
++        msg.msg_iov = &mut iov;
++        msg.msg_iovlen = 1;
++        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
++        msg.msg_controllen = mem::size_of_val(&control) as _;
++        let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC);
++        if n < 0 {
++            let e = io::Error::last_os_error();
++            return if e.kind() == io::ErrorKind::WouldBlock { Ok(Recv::WouldBlock) } else { Err(e) };
++        }
++        let mut uid = None;
++        let mut c = libc::CMSG_FIRSTHDR(&msg);
++        while !c.is_null() {
++            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_CREDENTIALS {
++                let cred = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::ucred);
++                uid = Some(cred.uid);
++            }
++            c = libc::CMSG_NXTHDR(&msg, c);
++        }
++        let Some(uid) = uid else { return Ok(Recv::Ignored) };
++        if msg.msg_flags & libc::MSG_TRUNC != 0 || !allowed(uid) {
++            return Ok(Recv::Ignored);
++        }
++        Ok(Recv::Ok(n as usize, Peer { addr, len: msg.msg_namelen, uid }))
++    }
++}
++
++static ACTIVE: Mutex<Option<(Instant, Option<u32>)>> = Mutex::new(None);
++
++/// The user logged in at the screen, from logind.
++fn active_uid() -> Option<u32> {
++    let mut cache = ACTIVE.lock().unwrap();
++    if let Some((at, uid)) = *cache {
++        if at.elapsed() < Duration::from_secs(1) {
++            return uid;
++        }
++    }
++    let uid = fs::read_to_string("/run/systemd/seats/seat0").ok().and_then(|s| {
++        s.lines()
++            .find_map(|l| l.strip_prefix("ACTIVE_UID="))
++            .and_then(|v| v.trim().parse().ok())
++    });
++    *cache = Some((Instant::now(), uid));
++    uid
++}
++
++pub fn allowed(uid: u32) -> bool {
++    uid == 0 || Some(uid) == active_uid()
++}
 diff --git a/src/takeover.rs b/src/takeover.rs
 new file mode 100644
-index 0000000..5cdffa8
+index 0000000..291808e
 --- /dev/null
 +++ b/src/takeover.rs
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,148 @@
 +//! Lets a local program draw on the whole Touch Bar for a while (a game, say).
 +//!
-+//! The program sends frames to the abstract unix datagram socket
-+//! `@tiny-dfr-takeover`:
++//! The program sends frames to the unix datagram socket
++//! `/run/tiny-dfr/takeover.sock`:
 +//!
 +//!   b"TDT1" | width: u16 LE | height: u16 LE | width*height bytes of RGB332
 +//!
@@ -279,20 +905,19 @@ index 0000000..5cdffa8
 +//! the keys in `FORWARDED_KEYS`, so no other typing is exposed; kind 2 = touch
 +//! down and 3 = touch up (value = x position in pixels, 0..width).
 +//!
-+//! Anyone on the machine can take over the bar, which is visible to the user,
-+//! and gets nothing back but those few keys while it does.
++//! Only the user at the screen (or root) can take over the bar and receive
++//! those keys; frames from anyone else are dropped (see `peer.rs`).
 +
++use crate::peer::{self, Peer, Recv};
 +use std::{
-+    io::ErrorKind,
 +    os::{
 +        fd::{AsFd, BorrowedFd},
-+        linux::net::SocketAddrExt,
-+        unix::net::{SocketAddr, UnixDatagram},
++        unix::net::UnixDatagram,
 +    },
 +    time::{Duration, Instant},
 +};
 +
-+pub const SOCKET_NAME: &[u8] = b"tiny-dfr-takeover";
++pub const SOCKET_NAME: &str = "takeover.sock";
 +pub const STALE_AFTER: Duration = Duration::from_millis(500);
 +const MAGIC: &[u8; 4] = b"TDT1";
 +const MAX_W: usize = 2200;
@@ -311,15 +936,13 @@ index 0000000..5cdffa8
 +pub struct Takeover {
 +    socket: Option<UnixDatagram>,
 +    frame: Option<Frame>,
-+    owner: Option<SocketAddr>,
++    owner: Option<Peer>,
 +    last_rx: Option<Instant>,
 +}
 +
 +impl Takeover {
 +    pub fn new() -> Takeover {
-+        let socket = SocketAddr::from_abstract_name(SOCKET_NAME)
-+            .and_then(|addr| UnixDatagram::bind_addr(&addr))
-+            .and_then(|s| s.set_nonblocking(true).map(|_| s));
++        let socket = peer::bind(SOCKET_NAME);
 +        let socket = match socket {
 +            Ok(s) => Some(s),
 +            Err(e) => {
@@ -341,17 +964,17 @@ index 0000000..5cdffa8
 +        let mut buf = vec![0u8; 8 + MAX_PIXELS];
 +        let mut got = false;
 +        loop {
-+            match socket.recv_from(&mut buf) {
-+                Ok((n, addr)) => {
++            match peer::recv(socket, &mut buf) {
++                Ok(Recv::Ok(n, from)) => {
 +                    if let Some(frame) = parse(&buf[..n]) {
 +                        self.frame = Some(frame);
-+                        self.owner = if addr.is_unnamed() { None } else { Some(addr) };
++                        self.owner = Some(from);
 +                        self.last_rx = Some(Instant::now());
 +                        got = true;
 +                    }
 +                }
-+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-+                Err(_) => break,
++                Ok(Recv::Ignored) => {}
++                Ok(Recv::WouldBlock) | Err(_) => break,
 +            }
 +        }
 +        if got {
@@ -384,7 +1007,7 @@ index 0000000..5cdffa8
 +        msg.push(kind);
 +        msg.extend_from_slice(&code.to_le_bytes());
 +        msg.extend_from_slice(&value.to_le_bytes());
-+        let _ = socket.send_to_addr(&msg, owner);
++        owner.send(socket, &msg);
 +    }
 +
 +    pub fn key(&self, code: u32, pressed: bool) {
@@ -415,29 +1038,26 @@ index 0000000..5cdffa8
 +}
 diff --git a/src/visualizer.rs b/src/visualizer.rs
 new file mode 100644
-index 0000000..f0e0988
+index 0000000..6988379
 --- /dev/null
 +++ b/src/visualizer.rs
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,89 @@
 +//! Receives audio levels for `Visualizer` buttons.
 +//!
-+//! Any local process can send bar heights as a datagram to the abstract unix
-+//! socket `@tiny-dfr-visualizer`: one byte per bar, 0 (silent) to 255 (loud),
-+//! at most `MAX_BARS` bars. Abstract sockets need no filesystem access, so this
-+//! works after tiny-dfr drops privileges and inside its systemd sandbox. The
-+//! data only changes what is drawn, so accepting it from any sender is harmless.
++//! The user at the screen can send bar heights as a datagram to the unix
++//! socket `/run/tiny-dfr/visualizer.sock`: one byte per bar, 0 (silent) to
++//! 255 (loud), at most `MAX_BARS` bars. Other users are ignored (see `peer.rs`).
 +
++use crate::peer::{self, Recv};
 +use std::{
-+    io::ErrorKind,
 +    os::{
 +        fd::{AsFd, BorrowedFd},
-+        linux::net::SocketAddrExt,
-+        unix::net::{SocketAddr, UnixDatagram},
++        unix::net::UnixDatagram,
 +    },
 +    time::{Duration, Instant},
 +};
 +
-+pub const SOCKET_NAME: &[u8] = b"tiny-dfr-visualizer";
++pub const SOCKET_NAME: &str = "visualizer.sock";
 +pub const MAX_BARS: usize = 256;
 +/// After this long without data the bars fall back to silence.
 +pub const STALE_AFTER: Duration = Duration::from_millis(500);
@@ -450,9 +1070,7 @@ index 0000000..f0e0988
 +
 +impl AudioFeed {
 +    pub fn new() -> AudioFeed {
-+        let socket = SocketAddr::from_abstract_name(SOCKET_NAME)
-+            .and_then(|addr| UnixDatagram::bind_addr(&addr))
-+            .and_then(|s| s.set_nonblocking(true).map(|_| s));
++        let socket = peer::bind(SOCKET_NAME);
 +        let socket = match socket {
 +            Ok(s) => Some(s),
 +            Err(e) => {
@@ -479,11 +1097,10 @@ index 0000000..f0e0988
 +        let mut buf = [0u8; MAX_BARS];
 +        let mut latest: Option<Vec<u8>> = None;
 +        loop {
-+            match socket.recv(&mut buf) {
-+                Ok(n) if n > 0 => latest = Some(buf[..n].to_vec()),
-+                Ok(_) => {}
-+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-+                Err(_) => break,
++            match peer::recv(socket, &mut buf) {
++                Ok(Recv::Ok(n, _)) if n > 0 => latest = Some(buf[..n].to_vec()),
++                Ok(Recv::Ok(..)) | Ok(Recv::Ignored) => {}
++                Ok(Recv::WouldBlock) | Err(_) => break,
 +            }
 +        }
 +        if let Some(levels) = latest {
@@ -514,6 +1131,3 @@ index 0000000..f0e0988
 +        &self.levels
 +    }
 +}
--- 
-2.56.0
-

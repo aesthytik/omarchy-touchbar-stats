@@ -62,9 +62,26 @@ tiny-dfr-plus is shared with
 `/etc/tiny-dfr/plus.d/`, and the stock tiny-dfr comes back when the last one is removed.
 The stats and Box Cat both use the whole bar, so opening one closes the other.
 
-The stats draw through tiny-dfr-plus's takeover socket (`@tiny-dfr-takeover`): 1085×30
+The stats draw through tiny-dfr-plus's takeover socket (`/run/tiny-dfr/takeover.sock`): 1085×30
 pixels, scaled 2× to the bar's 2170×60. While they're showing, tiny-dfr sends back only
 touches on the bar and Esc/Space/Up/Down presses; the stats only use the touches.
+
+### Who can use the sockets
+
+tiny-dfr-plus's sockets are files in `/run/tiny-dfr/`, a directory systemd creates for
+the daemon and only root can write to, so no other account can claim their names first.
+For every frame the kernel tells the daemon which user sent it; frames from anyone but
+the user logged in at the screen (or root) are dropped, and only that user is sent key
+and touch events. Programs check that events come from `/run/tiny-dfr/…` before using
+them.
+
+The same patch has a full-colour backdrop socket (`/run/tiny-dfr/backdrop.sock`) used by
+Touch Bar Scenes, with the same checks. Its key-column events, which say roughly where on
+the keyboard a key was pressed but never which key, are off unless `KeyPulses = true` is
+set in `/etc/tiny-dfr/config.toml`.
+
+The patch is built from a fixed upstream tiny-dfr commit (`a79f2f4`), fetched by its full
+SHA and checked out detached before building.
 
 ## Remove
 

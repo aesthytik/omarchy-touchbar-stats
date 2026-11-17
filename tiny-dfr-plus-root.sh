@@ -16,7 +16,8 @@ case $cmd in
     built=$3; shift 3
     install -Dm755 "$built" "$BIN"
     mkdir -p "$DROPIN_DIR" "$USERS"
-    printf '[Service]\nExecStart=\nExecStart=%s\n' "$BIN" >"$DROPIN"
+    # RuntimeDirectory gives the daemon root-owned /run/tiny-dfr for its sockets.
+    printf '[Service]\nExecStart=\nExecStart=%s\nRuntimeDirectory=tiny-dfr\nRuntimeDirectoryMode=0755\n' "$BIN" >"$DROPIN"
     : >"$USERS/$id"
     # Touch Bar Waveform 0.1 installed its own copy; tiny-dfr-plus replaces it.
     rm -f /usr/local/bin/tiny-dfr-waveform "$DROPIN_DIR/50-touchbar-waveform.conf"
